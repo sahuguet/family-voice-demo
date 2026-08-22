@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Family Voice Demo</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align: center; }
+    input[type="password"] { font-size: 16px; padding: 8px; width: 320px; }
+    button { font-size: 18px; padding: 12px 24px; border-radius: 8px; cursor: pointer; margin-top: 12px; }
+    #log { text-align: left; margin-top: 24px; white-space: pre-wrap; font-family: monospace; font-size: 13px; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>Talk to the companion</h1>
+  <input id="apiKey" type="password" placeholder="sk-... (OpenAI API key)">
+  <br>
+  <button id="startBtn">Start conversation</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <div id="log"></div>
+  <audio id="remoteAudio" autoplay></audio>
+
+<script src="../family-facts.js"></script>
+<script>
+const REALTIME_MODEL = "gpt-realtime-2.1";
+
+function log(msg) {
+  document.getElementById("log").textContent += msg + "\n";
+}
+
+let pc, dc;
+
+async function start() {
+  const apiKey = document.getElementById("apiKey").value.trim();
+  if (!apiKey) {
+    log("Enter your OpenAI API key first.");
+    return;
+  }
+
+  // Local-demo shortcut: calling /realtime/sessions straight from the
+  // browser with the real key. Fine for a throwaway local test since the
+  // key never leaves your machine; don't do this in anything hosted.
+  const sessionResp = await fetch("https://api.openai.com/v1/realtime/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: REALTIME_MODEL,
+      voice: "alloy",
+      instructions: buildSystemPrompt(),
+      tools: [FAMILY_TOOL],
+    }),
+  });
+  const session = await sessionResp.json();
+  const ephemeralKey = session.client_secret.value;
+
+  pc = new RTCPeerConnection();
+
+  const remoteAudio = document.getElementById("remoteAudio");
+  pc.ontrack = (e) => (remoteAudio.srcObject = e.streams[0]);
+
+  const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  micStream.getTracks().forEach((track) => pc.addTrack(track, micStream));
+
+  dc = pc.createDataChannel("oai-events");
+  dc.addEventListener("message", handleServerEvent);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  const sdpResp = await fetch(
+    `https://api.openai.com/v1/realtime?model=${REALTIME_MODEL}`,
+    {
+      method: "POST",
+      body: offer.sdp,
+      headers: {
+        Authorization: `Bearer ${ephemeralKey}`,
+        "Content-Type": "application/sdp",
+      },
+    }
+  );
+  const answer = { type: "answer", sdp: await sdpResp.text() };
+  await pc.setRemoteDescription(answer);
+
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").disabled = false;
+  log("Connected. Start talking.");
+}
+
+function handleServerEvent(e) {
+  const event = JSON.parse(e.data);
+
+  if (event.type === "response.function_call_arguments.done") {
+    const args = JSON.parse(event.arguments || "{}");
+    const facts = getFamilyFacts(args.topic);
+    log(`[injected facts for "${args.topic}"]: ${facts.join(" ")}`);
+
+    dc.send(
+      JSON.stringify({
+        type: "conversation.item.create",
+        item: {
+          type: "function_call_output",
+          call_id: event.call_id,
+          output: JSON.stringify({ facts }),
+        },
+      })
+    );
+    dc.send(JSON.stringify({ type: "response.create" }));
+  }
+
+  if (event.type === "response.audio_transcript.done") {
+    log(`Assistant: ${event.transcript}`);
+  }
+}
+
+function stop() {
+  pc?.close();
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+  log("Stopped.");
+}
+
+document.getElementById("startBtn").addEventListener("click", start);
+document.getElementById("stopBtn").addEventListener("click", stop);
+</script>
+</body>
+</html>

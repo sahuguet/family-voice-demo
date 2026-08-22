@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Family Voice Demo (AssemblyAI)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align: center; }
+    input[type="password"] { font-size: 16px; padding: 8px; width: 320px; }
+    button { font-size: 18px; padding: 12px 24px; border-radius: 8px; cursor: pointer; margin-top: 12px; }
+    #log { text-align: left; margin-top: 24px; white-space: pre-wrap; font-family: monospace; font-size: 13px; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>Talk to the companion</h1>
+  <button id="startBtn">Start conversation</button>
+  <button id="stopBtn" disabled>Stop</button>
+  <div id="log"></div>
+
+<script src="../family-facts.js"></script>
+<script>
+const PLAYBACK_SAMPLE_RATE = 24000; // AssemblyAI's audio/pcm format is fixed at 24kHz mono
+
+function log(msg) {
+  document.getElementById("log").textContent += msg + "\n";
+}
+
+let ws;
+let micContext;
+let micStream;
+let processorNode;
+let playbackContext;
+let nextPlaybackTime = 0;
+let activeSources = [];
+let pendingToolResults = [];
+
+function floatTo16BitPCM(float32Array) {
+  const out = new Int16Array(float32Array.length);
+  for (let i = 0; i < float32Array.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Array[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function downsample(float32Array, inputRate, outputRate) {
+  if (outputRate === inputRate) return float32Array;
+  const ratio = inputRate / outputRate;
+  const newLength = Math.round(float32Array.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    result[i] = float32Array[Math.min(Math.round(i * ratio), float32Array.length - 1)];
+  }
+  return result;
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToInt16Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(bytes.buffer);
+}
+
+async function start() {
+  // The browser can't authenticate to AssemblyAI directly (no custom
+  // WebSocket headers, and their browser-token endpoint isn't reachable),
+  // so we connect to our own server instead; server.py holds the real key
+  // and relays bytes to/from AssemblyAI over an authenticated connection.
+  ws = new WebSocket(`ws://${location.host}/relay`);
+
+  ws.onopen = () => {
+    ws.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          system_prompt: buildSystemPrompt(),
+          greeting: "Bonjour ! Je suis là dès que tu as envie de discuter.",
+          input: { format: { encoding: "audio/pcm" } },
+          output: { voice: "pierre", format: { encoding: "audio/pcm" } },
+          tools: [FAMILY_TOOL, WEB_SEARCH_TOOL],
+        },
+      })
+    );
+  };
+
+  ws.onmessage = (e) => handleServerEvent(JSON.parse(e.data));
+  ws.onerror = (e) => log("WebSocket error: " + JSON.stringify(e));
+  ws.onclose = () => log("Disconnected.");
+
+  playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+  nextPlaybackTime = 0;
+
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  micContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = micContext.createMediaStreamSource(micStream);
+
+  // ScriptProcessorNode is deprecated but keeps this demo to one file;
+  // swap for an AudioWorklet in production.
+  processorNode = micContext.createScriptProcessor(4096, 1, 1);
+  processorNode.onaudioprocess = (e) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const downsampled = downsample(input, micContext.sampleRate, PLAYBACK_SAMPLE_RATE);
+    const pcm16 = floatTo16BitPCM(downsampled);
+    ws.send(
+      JSON.stringify({
+        type: "input.audio",
+        audio: arrayBufferToBase64(pcm16.buffer),
+      })
+    );
+  };
+  source.connect(processorNode);
+  processorNode.connect(micContext.destination);
+
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").disabled = false;
+}
+
+function playChunk(base64Audio) {
+  const pcm16 = base64ToInt16Array(base64Audio);
+  const float32 = new Float32Array(pcm16.length);
+  for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 0x8000;
+
+  const buffer = playbackContext.createBuffer(1, float32.length, PLAYBACK_SAMPLE_RATE);
+  buffer.copyToChannel(float32, 0);
+
+  const sourceNode = playbackContext.createBufferSource();
+  sourceNode.buffer = buffer;
+  sourceNode.connect(playbackContext.destination);
+
+  const startAt = Math.max(playbackContext.currentTime, nextPlaybackTime);
+  sourceNode.start(startAt);
+  nextPlaybackTime = startAt + buffer.duration;
+  activeSources.push(sourceNode);
+  sourceNode.onended = () => {
+    activeSources = activeSources.filter((s) => s !== sourceNode);
+  };
+}
+
+function stopPlayback() {
+  activeSources.forEach((s) => {
+    try {
+      s.stop();
+    } catch (_) {}
+  });
+  activeSources = [];
+  nextPlaybackTime = playbackContext ? playbackContext.currentTime : 0;
+}
+
+function handleServerEvent(event) {
+  switch (event.type) {
+    case "session.ready":
+      log("Connected. Start talking.");
+      break;
+
+    case "input.speech.started":
+      stopPlayback(); // barge-in: stop agent audio when the user starts talking
+      break;
+
+    case "reply.audio":
+      playChunk(event.data);
+      break;
+
+    case "tool.call": {
+      // web_search needs a server-side API key, so server.py answers that
+      // one directly on the upstream connection; only handle our own tool here.
+      if (event.name !== "get_family_facts") break;
+      const facts = getFamilyFacts(event.arguments.topic);
+      log(`[injected facts for "${event.arguments.topic}"]: ${facts.join(" ")}`);
+      pendingToolResults.push({
+        type: "tool.result",
+        call_id: event.call_id,
+        result: JSON.stringify({ facts }),
+      });
+      break;
+    }
+
+    case "reply.done":
+      // Per AssemblyAI's docs: send accumulated tool results only after
+      // reply.done for the turn that triggered them, never immediately.
+      pendingToolResults.forEach((msg) => ws.send(JSON.stringify(msg)));
+      pendingToolResults = [];
+      break;
+
+    case "transcript.user":
+      log(`You: ${event.text}`);
+      break;
+
+    case "transcript.agent":
+      log(`Assistant: ${event.text}`);
+      break;
+
+    case "session.error":
+      log(`Error [${event.code}]: ${event.message}`);
+      break;
+  }
+}
+
+function stop() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "session.end" }));
+    ws.close();
+  }
+  processorNode?.disconnect();
+  micContext?.close();
+  micStream?.getTracks().forEach((t) => t.stop());
+  stopPlayback();
+  playbackContext?.close();
+
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+  log("Stopped.");
+}
+
+document.getElementById("startBtn").addEventListener("click", start);
+document.getElementById("stopBtn").addEventListener("click", stop);
+</script>
+</body>
+</html>

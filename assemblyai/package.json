@@ -1,0 +1,10 @@
+{
+  "name": "family-voice-agent-assemblyai",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.18.0",
+    "mic": "^2.1.2",
+    "speaker": "^0.5.5"
+  }
+}
