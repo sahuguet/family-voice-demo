@@ -33,7 +33,12 @@ mirror of the same content for the two Python-based AssemblyAI paths.
 
 ## Setup
 
-Fill in `.env` at the repo root:
+Create an account and get an API key from each:
+
+- [AssemblyAI](https://www.assemblyai.com/dashboard/signup) — powers the AssemblyAI Voice Agent demo
+- [Tavily](https://app.tavily.com/) — powers the `web_search` tool
+
+Then fill in `.env` at the repo root:
 
 ```
 ASSEMBLYAI_API_KEY=...
